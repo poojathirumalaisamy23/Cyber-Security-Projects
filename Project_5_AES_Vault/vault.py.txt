@@ -1,0 +1,135 @@
+import os
+import json
+import hashlib
+import argparse
+from datetime import datetime
+from cryptography.fernet import Fernet, InvalidToken
+
+VAULT_DIR = "vault_data"
+KEY_FILE = os.path.join(VAULT_DIR, "secret.key")
+META_FILE = os.path.join(VAULT_DIR, "metadata.json")
+
+def ensure_vault():
+    os.makedirs(VAULT_DIR, exist_ok=True)
+    if not os.path.exists(KEY_FILE):
+        key = Fernet.generate_key()
+        with open(KEY_FILE, "wb") as f:
+            f.write(key)
+        print(f"[+] Generated new key: {KEY_FILE}")
+    if not os.path.exists(META_FILE):
+        with open(META_FILE, "w") as f:
+            json.dump({}, f)
+
+def load_key():
+    with open(KEY_FILE, "rb") as f:
+        return f.read()
+
+def load_meta():
+    with open(META_FILE) as f:
+        return json.load(f)
+
+def save_meta(meta):
+    with open(META_FILE, "w") as f:
+        json.dump(meta, f, indent=2, default=str)
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+def encrypt_file(path):
+    ensure_vault()
+    with open(path, "rb") as f:
+        data = f.read()
+    original_hash = sha256(data)
+    fernet = Fernet(load_key())
+    ciphertext = fernet.encrypt(data)
+    encrypted_hash = sha256(ciphertext)
+    out_path = path + ".enc"
+    with open(out_path, "wb") as f:
+        f.write(ciphertext)
+    meta = load_meta()
+    meta[os.path.basename(out_path)] = {
+        "original_name": os.path.basename(path),
+        "original_size": len(data),
+        "encrypted_size": len(ciphertext),
+        "timestamp": datetime.now().isoformat(),
+        "sha256_original": original_hash,
+        "sha256_encrypted": encrypted_hash,
+    }
+    save_meta(meta)
+    print(f"[+] Encrypted -> {out_path}")
+    print(f"    original sha256:  {original_hash}")
+    print(f"    encrypted sha256: {encrypted_hash}")
+
+def decrypt_file(path):
+    ensure_vault()
+    meta = load_meta()
+    name = os.path.basename(path)
+    if name not in meta:
+        print(f"[!] No metadata for {name}. Cannot verify integrity.")
+        return
+    with open(path, "rb") as f:
+        ciphertext = f.read()
+    if sha256(ciphertext) != meta[name]["sha256_encrypted"]:
+        print("[!] TAMPER DETECTED: encrypted file hash mismatch. Aborting.")
+        return
+    fernet = Fernet(load_key())
+    try:
+        plaintext = fernet.decrypt(ciphertext)
+    except InvalidToken:
+        print("[!] Decryption failed.")
+        return
+    if sha256(plaintext) != meta[name]["sha256_original"]:
+        print("[!] INTEGRITY FAIL: decrypted content does not match original hash.")
+        return
+    out_path = path.replace(".enc", "")
+    if os.path.exists(out_path):
+        out_path = out_path + ".restored"
+    with open(out_path, "wb") as f:
+        f.write(plaintext)
+    print(f"[+] Decrypted -> {out_path} (integrity verified)")
+
+def verify_file(path):
+    ensure_vault()
+    meta = load_meta()
+    name = os.path.basename(path)
+    if name not in meta:
+        print(f"[!] No metadata for {name}.")
+        return
+    with open(path, "rb") as f:
+        ciphertext = f.read()
+    ok = sha256(ciphertext) == meta[name]["sha256_encrypted"]
+    print(f"[{'OK' if ok else 'TAMPERED'}] {name}")
+
+def list_vault():
+    ensure_vault()
+    meta = load_meta()
+    if not meta:
+        print("(vault is empty)")
+        return
+    print(f"{'File':<30} {'Original':<20} {'Size':<10} {'Timestamp'}")
+    print("-" * 90)
+    for fname, info in meta.items():
+        print(f"{fname:<30} {info['original_name']:<20} {info['original_size']:<10} {info['timestamp']}")
+
+def main():
+    parser = argparse.ArgumentParser(description="AES file vault")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    p_enc = sub.add_parser("encrypt")
+    p_enc.add_argument("file")
+    p_dec = sub.add_parser("decrypt")
+    p_dec.add_argument("file")
+    p_ver = sub.add_parser("verify")
+    p_ver.add_argument("file")
+    sub.add_parser("list")
+    args = parser.parse_args()
+    if args.cmd == "encrypt":
+        encrypt_file(args.file)
+    elif args.cmd == "decrypt":
+        decrypt_file(args.file)
+    elif args.cmd == "verify":
+        verify_file(args.file)
+    elif args.cmd == "list":
+        list_vault()
+
+if __name__ == "__main__":
+    main()

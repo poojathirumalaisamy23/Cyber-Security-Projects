@@ -1,0 +1,250 @@
+import re
+import argparse
+import os
+from datetime import datetime, timedelta
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+
+# ---------- PARSERS ----------
+APACHE_RE = re.compile(
+    r'^(?P<ip>\S+) \S+ \S+ \[(?P<time>[^\]]+)\] '
+    r'"(?P<method>\S+) (?P<path>\S+) \S+" '
+    r'(?P<status>\d{3}) (?P<size>\S+) "[^"]*" "(?P<user_agent>[^"]*)"'
+)
+
+SSH_FAIL_RE = re.compile(
+    r'^(?P<time>\w+ \d+ \d+:\d+:\d+) \S+ sshd\[\d+\]: '
+    r'Failed password for (?:invalid user )?(?P<user>\S+) '
+    r'from (?P<ip>\S+) port \d+'
+)
+
+
+def parse_apache(path):
+    rows = []
+    with open(path, "r", errors="ignore") as f:
+        for line in f:
+            m = APACHE_RE.match(line)
+            if not m:
+                continue
+            d = m.groupdict()
+            try:
+                d["time"] = datetime.strptime(d["time"], "%d/%b/%Y:%H:%M:%S %z")
+            except Exception:
+                continue
+            d["status"] = int(d["status"])
+            d["size"] = int(d["size"]) if d["size"].isdigit() else 0
+            rows.append(d)
+    return pd.DataFrame(rows)
+
+
+def parse_ssh(path):
+    rows = []
+    with open(path, "r", errors="ignore") as f:
+        for line in f:
+            m = SSH_FAIL_RE.match(line)
+            if not m:
+                continue
+            d = m.groupdict()
+            try:
+                d["time"] = datetime.strptime(
+                    f"{datetime.now().year} {d['time']}", "%Y %b %d %H:%M:%S"
+                )
+            except Exception:
+                continue
+            rows.append(d)
+    return pd.DataFrame(rows)
+
+
+# ---------- DETECTIONS ----------
+def detect_ssh_bruteforce(df, threshold=10, window_min=5):
+    findings = []
+    if df.empty:
+        return findings
+    df = df.sort_values("time")
+    for ip, group in df.groupby("ip"):
+        times = group["time"].tolist()
+        i = 0
+        while i < len(times):
+            window_end = times[i] + timedelta(minutes=window_min)
+            j = i
+            while j < len(times) and times[j] <= window_end:
+                j += 1
+            count = j - i
+            if count > threshold:
+                findings.append({
+                    "type": "SSH Brute Force",
+                    "ip": ip,
+                    "count": count,
+                    "first_seen": times[i],
+                    "last_seen": times[j - 1],
+                    "evidence": f"{count} failed logins in {window_min} min",
+                })
+                i = j
+            else:
+                i += 1
+    best = {}
+    for f in findings:
+        if f["ip"] not in best or f["count"] > best[f["ip"]]["count"]:
+            best[f["ip"]] = f
+    return list(best.values())
+
+
+def detect_web_scanning(df, threshold=30, window_min=1):
+    findings = []
+    if df.empty:
+        return findings
+    sensitive = ["/admin", "/.env", "/wp-login", "/phpmyadmin", "../"]
+    suspicious_uas = ["sqlmap", "nikto", "nmap", "masscan"]
+
+    for ip, group in df.groupby("ip"):
+        group = group.sort_values("time")
+
+        f404 = group[group["status"] == 404]
+        if not f404.empty:
+            times = f404["time"].tolist()
+            i = 0
+            while i < len(times):
+                window_end = times[i] + timedelta(minutes=window_min)
+                j = i
+                while j < len(times) and times[j] <= window_end:
+                    j += 1
+                if (j - i) > threshold:
+                    findings.append({
+                        "type": "Web Scanning (404 burst)",
+                        "ip": ip,
+                        "count": j - i,
+                        "first_seen": times[i],
+                        "last_seen": times[j - 1],
+                        "evidence": f"{j - i} 404s in {window_min} min",
+                    })
+                    break
+                i += 1
+
+        for path in sensitive:
+            hits = group[group["path"].str.contains(re.escape(path), na=False)]
+            if not hits.empty:
+                findings.append({
+                    "type": "Sensitive Path Access",
+                    "ip": ip,
+                    "count": len(hits),
+                    "first_seen": hits["time"].min(),
+                    "last_seen": hits["time"].max(),
+                    "evidence": f"Accessed {path} ({len(hits)}x)",
+                })
+
+        for ua in suspicious_uas:
+            hits = group[group["user_agent"].str.contains(ua, case=False, na=False)]
+            if not hits.empty:
+                findings.append({
+                    "type": "Suspicious User-Agent",
+                    "ip": ip,
+                    "count": len(hits),
+                    "first_seen": hits["time"].min(),
+                    "last_seen": hits["time"].max(),
+                    "evidence": f"UA matched '{ua}'",
+                })
+    return findings
+
+
+def check_blacklist(df, blacklist_path):
+    findings = []
+    if df.empty or not os.path.exists(blacklist_path):
+        return findings
+    with open(blacklist_path) as f:
+        bad_ips = {line.strip() for line in f if line.strip()}
+    for ip in df["ip"].unique():
+        if ip in bad_ips:
+            hits = df[df["ip"] == ip]
+            findings.append({
+                "type": "Blacklisted IP",
+                "ip": ip,
+                "count": len(hits),
+                "first_seen": hits["time"].min(),
+                "last_seen": hits["time"].max(),
+                "evidence": "IP present in blacklist file",
+            })
+    return findings
+
+
+# ---------- CHARTS ----------
+def make_charts(apache_df, ssh_df, out_dir="output"):
+    os.makedirs(out_dir, exist_ok=True)
+
+    if not ssh_df.empty:
+        top = ssh_df.groupby("ip").size().sort_values(ascending=False).head(10)
+        plt.figure(figsize=(8, 4))
+        top.plot(kind="bar", color="tomato")
+        plt.title("Top 10 IPs by Failed SSH Logins")
+        plt.ylabel("Failed Logins")
+        plt.tight_layout()
+        plt.savefig(f"{out_dir}/ssh_failed_logins.png")
+        plt.close()
+
+    if not apache_df.empty:
+        apache_df = apache_df.sort_values("time")
+        per_min = apache_df.set_index("time").resample("1min").size()
+        plt.figure(figsize=(10, 4))
+        per_min.plot(color="steelblue")
+        plt.title("Apache Requests Over Time")
+        plt.ylabel("Requests/min")
+        plt.tight_layout()
+        plt.savefig(f"{out_dir}/apache_requests_over_time.png")
+        plt.close()
+
+
+# ---------- REPORT ----------
+def write_report(findings, out_path):
+    lines = ["# Incident Report", ""]
+    lines.append(f"Generated: {datetime.now().isoformat()}")
+    lines.append(f"Total findings: {len(findings)}")
+    lines.append("")
+    if not findings:
+        lines.append("No suspicious activity detected.")
+    else:
+        lines.append("| Type | IP | Count | First Seen | Last Seen | Evidence |")
+        lines.append("|------|----|-------|-----------|-----------|----------|")
+        for f in findings:
+            lines.append(
+                f"| {f['type']} | {f['ip']} | {f['count']} | "
+                f"{f['first_seen']} | {f['last_seen']} | {f['evidence']} |"
+            )
+    with open(out_path, "w") as f:
+        f.write("\n".join(lines))
+    print(f"Report written to {out_path}")
+
+
+# ---------- MAIN ----------
+def main():
+    parser = argparse.ArgumentParser(description="Log analyzer for intrusion detection")
+    parser.add_argument("--apache", help="Path to Apache access log")
+    parser.add_argument("--ssh", help="Path to SSH auth log")
+    parser.add_argument("--blacklist", help="Optional IP blacklist file")
+    parser.add_argument("--out", default="output/incident_report.md")
+    args = parser.parse_args()
+
+    os.makedirs("output", exist_ok=True)
+
+    apache_df = parse_apache(args.apache) if args.apache else pd.DataFrame()
+    ssh_df = parse_ssh(args.ssh) if args.ssh else pd.DataFrame()
+
+    findings = []
+    findings += detect_ssh_bruteforce(ssh_df)
+    findings += detect_web_scanning(apache_df)
+
+    if args.blacklist:
+        combined = pd.concat([apache_df, ssh_df], ignore_index=True)
+        findings += check_blacklist(combined, args.blacklist)
+
+    make_charts(apache_df, ssh_df)
+    write_report(findings, args.out)
+
+    print(f"\nDetected {len(findings)} findings:")
+    for f in findings:
+        print(f"  [{f['type']}] {f['ip']} â€” {f['evidence']}")
+
+
+if __name__ == "__main__":
+    main()
